@@ -1,62 +1,68 @@
 class Strategy:
     def __init__(self):
-        # Usamos 3 puntos básicos (0.0003) como indica el justfile
+        # Fee real de 3 bps (0.0003)
         self.fee = 0.0003
-        self.initialized = True
-        
+        # Bajamos el umbral para capturar más volumen de operaciones
+        self.min_profit_margin = 1.0002
+
     def on_data(self, market_data, balances):
-        # Definición de pares según los archivos que me mandaste
-        t1_f = "token_1/fiat"      # ETH/USDT
-        t2_f = "token_2/fiat"      # BTC/USDT
-        t1_t2 = "token_1/token_2"  # ETH/BTC
+        t1_f = "token_1/fiat"
+        t2_f = "token_2/fiat"
+        t1_t2 = "token_1/token_2"
 
         if not all(p in market_data for p in [t1_f, t2_f, t1_t2]):
             return []
 
-        # Precios actuales
-        p1 = market_data[t1_f]["close"]     # Precio ETH en USDT
-        p2 = market_data[t2_f]["close"]     # Precio BTC en USDT
-        p12 = market_data[t1_t2]["close"]   # Precio ETH en BTC
+        p1 = market_data[t1_f]["close"]
+        p2 = market_data[t2_f]["close"]
+        p12 = market_data[t1_t2]["close"]
+        f = self.fee
 
-        # --- ESTRATEGIA: ARBITRAJE TRIANGULAR ---
-        # Calculamos el retorno neto de los dos ciclos posibles (3 comisiones cada uno)
-        # Factor de pérdida por comisiones: (1 - 0.0003)^3 ≈ 0.9991
-        fee_factor = (1 - self.fee) ** 3
+        # Factor de comisiones para 3 saltos
+        net_factor = (1 - f) ** 3
 
-        # Ciclo A: USDT -> comprar ETH -> vender ETH por BTC -> vender BTC por USDT
-        # Fórmula: (1/p1 * p12 * p2) * fee_factor
-        rent_a = (p12 * p2 / p1) * fee_factor
+        # Cálculo de rentabilidad neta
+        ret_A = (p12 * p2 / p1) * net_factor
+        ret_B = (p1 / (p2 * p12)) * net_factor
 
-        # Ciclo B: USDT -> comprar BTC -> comprar ETH con BTC -> vender ETH por USDT
-        # Fórmula: (1/p2 / p12 * p1) * fee_factor
-        rent_b = (p1 / (p2 * p12)) * fee_factor
+        fiat_total = balances.get("fiat", 0)
 
-        # Usamos el 95% del balance de USDT para dejar un margen de seguridad
-        fiat_disponible = balances.get("fiat", 0)
-        monto_operar = fiat_disponible * 0.95
+        # --- LÓGICA DE ESCALAMIENTO DINÁMICO ---
+        # Si la oportunidad es mejor, arriesgamos más capital
+        max_ret = max(ret_A, ret_B)
 
-        # Si el retorno es mayor a 1.0 (más un margen de seguridad de 0.01%)
-        umbral = 1.0001
+        if max_ret > 1.0012:      # Oportunidad de Oro
+            cap_pct = 0.90
+        elif max_ret > 1.0006:    # Oportunidad Buena
+            cap_pct = 0.70
+        else:                     # Oportunidad Normal
+            cap_pct = 0.40
 
-        # EJECUCIÓN CICLO A
-        if rent_a > umbral and monto_operar > 10:
-            q_eth = monto_operar / p1
-            q_btc = q_eth * (1 - self.fee) * p12
+        monto_fiat = fiat_total * cap_pct
+
+        # --- EJECUCIÓN CICLO A ---
+        if ret_A > self.min_profit_margin and fiat_total > 20:
+            # Factor 0.999 de seguridad para evitar errores de balance
+            q1 = (monto_fiat / (p1 * (1 + f))) * 0.999
+            q1_net = q1 * (1 - f)
+            q2_net = q1_net * p12 * (1 - f)
+
             return [
-                {"pair": t1_f, "side": "buy", "qty": q_eth},
-                {"pair": t1_t2, "side": "sell", "qty": q_eth * (1 - self.fee)},
-                {"pair": t2_f, "side": "sell", "qty": q_btc * (1 - self.fee)}
+                {"pair": t1_f, "side": "buy", "qty": round(q1, 7)},
+                {"pair": t1_t2, "side": "sell", "qty": round(q1_net, 7)},
+                {"pair": t2_f, "side": "sell", "qty": round(q2_net, 7)}
             ]
 
-        # EJECUCIÓN CICLO B
-        if rent_b > umbral and monto_operar > 10:
-            q_btc = monto_operar / p2
-            # Cuánto ETH compramos con ese BTC
-            q_eth = (q_btc * (1 - self.fee)) / p12
+        # --- EJECUCIÓN CICLO B ---
+        elif ret_B > self.min_profit_margin and fiat_total > 20:
+            q2 = (monto_fiat / (p2 * (1 + f))) * 0.999
+            q2_net = q2 * (1 - f)
+            q1_net = q2_net / (p12 * (1 + f))
+
             return [
-                {"pair": t2_f, "side": "buy", "qty": q_btc},
-                {"pair": t1_t2, "side": "buy", "qty": q_eth},
-                {"pair": t1_f, "side": "sell", "qty": q_eth * (1 - self.fee)}
+                {"pair": t2_f, "side": "buy", "qty": round(q2, 7)},
+                {"pair": t1_t2, "side": "buy", "qty": round(q1_net, 7)},
+                {"pair": t1_f, "side": "sell", "qty": round(q1_net * (1 - f), 7)}
             ]
 
         return []
